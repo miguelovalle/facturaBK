@@ -9,7 +9,11 @@ yarn-error.log*
 !.vscode/extensions.json
 /andes
 /xmlfiles
+/pdfFiles
 /zips
 /Sincronizacion_INM_ver_1.0.0
 /doc_base64.txt
 /Sincronizacion_INM_ver_1
+
+# Env filescls
+.env

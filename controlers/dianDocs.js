@@ -1,151 +1,300 @@
 const { response } = require('express');
-const { parseXml } = require('../utils/xmlParser');
-const {
-  generarHashSHA384,
-  createfilename,
-  actualizaCUFE,
-  crearZIPadm,
-} = require('../modulesBK/createXML');
-
-//const { signFile } = require('../modulesBK/firmar');
-const { firmarSobre, enviarSobre } = require('../soapFns/soapFirma');
 const { firmaJava } = require('../modulesBK/firmaJava');
 const { procesaRtaDian } = require('../soapFns/procesaRtaDian');
+const { sendMail } = require('../fnAttached/sendMail');
+const { executeContingency } = require('../modulesBK/executeContingency');
+const { sendToDian } = require('../modulesBK/sendToDian');
+const handleSuccessFlow = require('../modulesBK/handleSuccessFlow');
+const fs = require('fs');
+const path = require('path');
+const {
+  toBool,
+  sendResponse,
+  parseAndExtractData,
+  generateCodes,
+  prepareFiles,
+} = require('../helpers/utils');
+
+const validateInput = (req) => {
+  if (!req.body) throw new Error('No se recibieron datos en la petición');
+};
+
+// --- Main Controller ---
 
 const envioDian = async (req, res = response) => {
+  // Global state for timeout handling
+  let responded = false;
+  const processTimeoutMs = Number(
+    process.env.EXPRESS_PROCESS_TIMEOUT_MS || 60000
+  );
+  const dianTimeoutMs = Number(process.env.DIAN_TIMEOUT_MS || 30000);
+
+  // Safety timeout
+  const processTimer = setTimeout(() => {
+    if (!responded) {
+      responded = true;
+      sendResponse(res, 408, {
+        ok: false,
+        mensaje: 'Demora: el proceso no terminó en tiempo esperado',
+        evento: 'demora_Server_Local',
+        datos: { CUFE: undefined }, // Partial data if available? Hard to pass here without closure scope
+      });
+    }
+  }, processTimeoutMs);
+
+  const safeSend = (status, data) => {
+    if (responded) return;
+    responded = true;
+    clearTimeout(processTimer);
+    sendResponse(res, status, data);
+  };
+
   try {
-    let raiz;
+    validateInput(req);
+
+    // 1. Prepare Data
+    const data = await parseAndExtractData(req.body);
+
+    // 2. Generate Codes
+    const { softCode, CUFE } = await generateCodes(data);
+
+    // 3. Prepare Files
+    const { xmlUpdated, nameXML, folderName } = await prepareFiles(
+      data,
+      softCode,
+      CUFE
+    );
+
+    // 4. Check Contingency (Requested or Env)
+    if (data.soft.contingencia || toBool(process.env.DIAN_CONTINGENCIA)) {
+      const result = await executeContingency(
+        data,
+        xmlUpdated,
+        nameXML,
+        folderName,
+        CUFE
+      );
+      return safeSend(200, result);
+    }
+
+    // 5. Sign Document
+    let signed;
     try {
-      raiz = await parseXml(req.body);
-    //  console.log('XML parseado correctamente:', JSON.stringify(raiz, null, 2));
+      signed = await firmaJava(nameXML, xmlUpdated);
     } catch (error) {
-      console.error('Error al parsear XML:', error);
-      return res.status(400).json({
-        ok: false,
-        error: 'Error al procesar el XML',
-        detalles: error.message,
-      });
-    }
-    //  Extraer datos con valores por defecto
-    const { soft, cufe } = raiz.params;
-
-    const softid = soft.softid || '';
-    const pin = soft.pin || '';
-    const nodctos = soft.nodctos || '';
-    const init = soft.initName || '';
-    const action = soft.action || '';
-    const endPoint = soft.endPoint || '';
-    const testSetId = soft.testSetId || '';
-
-    const NoFra = cufe.NoFra || '';
-    const consecutivo = cufe.consecutivo || '';
-    const FechaFactura = cufe.FechaFactura || '';
-    const HoraFactura = cufe.HoraFactura || '';
-    const VrBase = cufe.VrBase || '';
-    const Imp = cufe.Imp || '';
-    const VrTotal = cufe.VrTotal || '';
-    const Nit = cufe.Nit || '';
-    const cc = cufe.cc || '';
-    let claveTc = cufe.claveTc || '';
-    const ambient = cufe.ambient || '';
-
-    // 6. Validar campos obligatorios
-    const camposRequeridos = {
-      softid,
-      pin,
-      NoFra,
-      Nit,
-      VrTotal,
-      FechaFactura,
-      HoraFactura,
-    };
-
-    const faltantes = Object.entries(camposRequeridos)
-      .filter(([_, value]) => !value)
-      .map(([key]) => key);
-
-    if (faltantes.length > 0) {
-      console.log('Campos requeridos faltantes:', faltantes);
-      return res.status(400).json({
-        ok: false,
-        error: 'Faltan campos obligatorios',
-        camposFaltantes: faltantes,
-      });
+      throw new Error(`Error al firmar el documento: ${error.message}`);
     }
 
-    let tyeDoc;
-    switch (init) {
-      case 'fv':
-        tyeDoc = 'Invoice';
-        break;
-      case 'nc':
-        tyeDoc = 'CreditNote';
-        claveTc = pin;
-        break;
-      case 'nd':
-        tyeDoc = 'DebitNote';
-        claveTc = pin;
-        break;
-      default:
-        break;
+    // 6. Send to DIAN
+    let responseDian;
+    let intentoEnvioDian = false;
+    let rtaDianRecibida = false;
+
+    try {
+      intentoEnvioDian = true;
+      responseDian = await sendToDian(
+        data,
+        signed,
+        nameXML,
+        folderName,
+        dianTimeoutMs
+      );
+
+      console.log('respuesta DIAN: ', responseDian);
+
+      rtaDianRecibida = true;
+    } catch (error) {
+      if (error.code === 'TIMEOUT') {
+        return safeSend(504, {
+          ok: false,
+          mensaje: 'Demora: DIAN no respondió dentro del tiempo configurado',
+          evento: 'demora_dian',
+          datos: {
+            CUFE,
+            folderName,
+            envio_dian_intentado: intentoEnvioDian,
+            rta_dian_recibida: rtaDianRecibida,
+          },
+        });
+      }
+      throw error;
     }
 
-    const softCode = await generarHashSHA384(softid + pin + NoFra);
-    const CUFE = await generarHashSHA384(
-      NoFra +
-        FechaFactura +
-        HoraFactura +
-        VrBase +
-        '010.00' +
-        '04' +
-        Imp +
-        '030.00' +
-        VrTotal +
-        Nit +
-        cc +
-        claveTc +
-        ambient
-    );
-    console.log('CUFE', CUFE);
+    // 7. Process DIAN Response
+    const webservice = data.soft.action;
 
-    let xmlUpdated = await actualizaCUFE(softCode, CUFE, tyeDoc);
+    const objRta = await procesaRtaDian(responseDian, webservice);
 
-    const { nameXML, folderName } = await createfilename(
-      FechaFactura,
-      Nit,
-      consecutivo,
-      init
-    );
-    const signed = await firmaJava(nameXML, xmlUpdated);
-    //const signed = await signFile(nameXML, xmlUpdated);
+    console.log('objRta procesada: ', objRta);
 
-    //empaquetar en zip
-    await crearZIPadm(signed, nameXML, folderName);
-    // Generar Sobre Firmado
-    const sobreFirmado = await firmarSobre(
-      folderName,
-      action,
-      endPoint,
-      testSetId,
-      ambient
-    );
-    // envio a DIAN
-    const response = await enviarSobre(action, endPoint, sobreFirmado);
+    // 8. Handle Production Errors (Fallback to Contingency)
+    if (data.cufe.ambient === '1') {
+      if (!objRta || objRta.isValid === false) {
+        // estando en ambiente habilitacion, no recibe respuesta Dian y lanza conrtingencia
+        const description =
+          objRta?.description || objRta?.msg || 'Sin descripción';
+        const statusCode = objRta?.statusCode ?? 'Sin código';
+        const errorList = Array.isArray(objRta?.errorList)
+          ? objRta.errorList
+          : objRta?.errorList
+          ? [objRta.errorList]
+          : [];
+        const numericStatus = Number(statusCode);
 
-    // procesa la respuesta
-    const objRta = await procesaRtaDian(response);
-    objRta.CUFE = CUFE;
-    objRta.nameXML = nameXML;
-    objRta.folderName = folderName;
-   // console.log('respuesta', objRta);
-    //en la respuesta del envio a la dian viene un xml con la respunesta. si la respuesta es aprobado, deveulve el cufe
-    // si la respuesta es rechazada, devuelve el nombre del xml firmado
-    console.log('Proceso completado exitosamente');
-    res.status(200).json(objRta);
+        // If server error (>= 500), try contingency
+        if (!Number.isNaN(numericStatus) && numericStatus >= 500) {
+          try {
+            const contResult = await executeContingency(
+              data,
+              xmlUpdated,
+              nameXML,
+              folderName,
+              CUFE,
+              'DIAN con error (>=500). Documento emitido en contingencia (04) y enviado al cliente'
+            );
+
+            // Enrich contingency result with original error details
+            contResult.ok = false; // It's a failure of the primary flow, even if contingency worked
+            contResult.error = {
+              message: 'DIAN no disponible o con error de servidor',
+              details: {
+                description,
+                statusCode,
+                errorList,
+                ...(objRta?.msg ? { msg: objRta.msg } : {}),
+              },
+            };
+            return safeSend(502, contResult);
+          } catch (contErr) {
+            // Contingency also failed
+            return safeSend(502, {
+              ok: objRta?.isValid || false,
+              mensaje: objRta?.msg || `${description} ${statusCode}`,
+              datos: { CUFE, folderName },
+              noDcto: data.cufe.idFactura,
+              error: {
+                message: 'Fallo contingencia tras error de DIAN',
+                details: {
+                  description,
+                  statusCode,
+                  errorList,
+                  ...(objRta?.msg ? { msg: objRta.msg } : {}),
+                },
+              },
+            });
+          }
+        } else {
+          // Rejection (Client Error or Business Rule)
+          // Send email to engineer (commented out in original, kept consistent)
+
+          const options = {
+            from:
+              '"Marinos Bar Pescadero Restaurante" <' +
+              (process.env.GMAIL_USER || 'femarinosbar@gmail.com') +
+              '>',
+            to: 'miguelovalleba@gmail.com',
+            subject: 'Error en la factura electrónica',
+            text: `description: ${description} statusCode: ${statusCode} lista errores: ${errorList.join(
+              ', '
+            )}`,
+          };
+          try {
+            await sendMail(options);
+          } catch (e) {}
+
+          return safeSend(502, {
+            ok: objRta?.isValid || false,
+            mensaje: objRta?.msg || `${description} ${statusCode}`,
+            datos: { CUFE, folderName },
+            noDcto: data.cufe.idFactura,
+            error: {
+              message: 'DIAN rechazó el documento',
+              details: {
+                description,
+                statusCode,
+                errorList,
+                ...(objRta?.msg ? { msg: objRta.msg } : {}),
+              },
+            },
+          });
+        }
+      } else {
+        // Flujo si DIAN responde OK en producción
+        // Responder inmediatamente al cliente y ejecutar tareas posteriores en segundo plano
+        const result = {
+          ok: objRta.isValid,
+          mensaje: objRta.msg,
+          datos: { CUFE, folderName },
+          noDcto: data.cufe.idFactura,
+          error: '',
+        };
+        safeSend(200, result);
+
+        // Ejecutar tareas de post-proceso sin bloquear la respuesta HTTP
+        (async () => {
+          try {
+            await handleSuccessFlow(
+              data,
+              signed,
+              responseDian,
+              objRta,
+              CUFE,
+              folderName
+            );
+          } catch (postErr) {
+            console.error('Error en flujo posterior al éxito:', postErr);
+          }
+        })();
+        return;
+      }
+    }
+
+    // 9. Test Environment Success
+    return safeSend(200, {
+      ok: true,
+      mensaje: objRta?.msg || 'Enviado en ambiente de pruebas',
+      datos: { CUFE, folderName, apikey: objRta?.apikey || '' },
+      noDcto: data.cufe.idFactura,
+      error: '',
+    });
   } catch (error) {
-    console.error('Error en envioDian:', error);
-    objRta.msg = 'Error en procesamiento de la firma';
-    res.status(500).json(objRta);
+    // Top Level Error Handler
+
+    // Send email to engineer
+    const options = {
+      from:
+        '"Marinos Bar Pescadero Restaurante" <' +
+        (process.env.GMAIL_USER || 'femarinosbar@gmail.com') +
+        '>',
+      to: 'miguelovalleba@gmail.com',
+      subject: 'Error en la factura electrónica',
+      text: `Error en el proceso: ${error.message}`,
+    };
+    try {
+      await sendMail(options);
+    } catch (e) {
+      console.error('Error mail ingeniero:', e);
+    }
+
+    const statusCode =
+      error.statusCode || (error.code === 'VALIDATION_ERROR' ? 422 : 500);
+
+    return safeSend(statusCode, {
+      ok: false,
+      mensaje:
+        error.code === 'VALIDATION_ERROR'
+          ? 'Error de validación'
+          : 'Error en el proceso de facturación electrónica',
+      datos: { CUFE: undefined }, // We might not have CUFE/folderName if error happened early
+      noDcto: '', // Might not have it
+      error: {
+        message: error.message,
+        details:
+          process.env.NODE_ENV === 'development'
+            ? { stack: error.stack, validation: error.validationErrors }
+            : error.validationErrors,
+      },
+    });
   }
 };
 module.exports = { envioDian };

@@ -1,12 +1,11 @@
+require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 require('body-parser-xml')(bodyParser);
-const fs = require('fs');
 
 const app = express();
-// process.on('uncaughtException', (err) => {
-//   console.error('Excepción no capturada:', err.message);
-// });
+
+app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.text({ 
   type: ['text/xml', 'application/xml'], 
   limit: '50mb' 
@@ -28,6 +27,7 @@ app.use(bodyParser.text({
     req.rawBody = buf.toString();
   }
 }));
+
 // todo lo que exporte  el archivo ./routes/dianDocs lo va a habilitar en la ruta del  endpoint api/dianDocs
 app.use('/api/dianDocs', require('./routes/dianDocs'));
 

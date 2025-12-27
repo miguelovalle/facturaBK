@@ -2,6 +2,7 @@ var SignedXml = require('xml-crypto').SignedXml;
 const fs = require('fs');
 const { sobreParaFirma } = require('../soapFns/sobreParaFirma');
 const { v4: uuidv4 } = require('uuid');
+const path = require('path');
 
 const firmarSobre = async (
   folderName,
@@ -22,7 +23,16 @@ const firmarSobre = async (
       zip64
     );
 
-    const keyPem = fs.readFileSync('./andes/private_key.pem', 'utf-8');
+    const keyPath = path.resolve(process.cwd(), './andes/private_key.pem');
+    let keyPem;
+    try {
+      keyPem = fs.readFileSync(keyPath, 'utf-8');
+    } catch (err) {
+      throw new Error(`No se pudo leer la clave privada en ${keyPath}: ${err.message}`);
+    }
+    if (!keyPem || !keyPem.trim()) {
+      throw new Error(`La clave privada está vacía en ${keyPath}. Extrae 'private_key.pem' desde el .p12/.pfx.`);
+    }
 
     const sig = new SignedXml({
       idAttribute: 'Id',
@@ -30,13 +40,36 @@ const firmarSobre = async (
       idMode: 'wssecurity',
     });
 
-    sig.privateKey = keyPem;
+    // Soporte para clave con passphrase (si tu PEM está cifrado)
+    const keyObject = process.env.ANDES_KEY_PASSPHRASE
+      ? { key: keyPem, passphrase: process.env.ANDES_KEY_PASSPHRASE }
+      : keyPem;
+
+    sig.privateKey = keyObject;
+
+    // Referencia a wsa:To (wsu:Id='id-...69322')
     sig.addReference({
       xpath:
         "//*[@*[local-name()='Id' and namespace-uri()='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd']='id-7263790894BC9CCD41173783960969322']",
       digestAlgorithm: 'http://www.w3.org/2001/04/xmlenc#sha256',
       transforms: ['http://www.w3.org/2001/10/xml-exc-c14n#'],
-      inclusiveNamespacesPrefixList: ['soap', 'wcf'],
+      inclusiveNamespacesPrefixList: ['soap', 'wcf', 'wsa'],
+    });
+    // Referencia al Timestamp (wsu:Id='TS-...70524')
+    sig.addReference({
+      xpath:
+        "//*[@*[local-name()='Id' and namespace-uri()='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd']='TS-7263790894BC9CCD41173783960970524']",
+      digestAlgorithm: 'http://www.w3.org/2001/04/xmlenc#sha256',
+      transforms: ['http://www.w3.org/2001/10/xml-exc-c14n#'],
+      inclusiveNamespacesPrefixList: ['soap', 'wcf', 'wsa'],
+    });
+    // Referencia al Body (wsu:Id='id-Body-...70525')
+    sig.addReference({
+      xpath:
+        "//*[@*[local-name()='Id' and namespace-uri()='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd']='id-Body-7263790894BC9CCD41173783960970525']",
+      digestAlgorithm: 'http://www.w3.org/2001/04/xmlenc#sha256',
+      transforms: ['http://www.w3.org/2001/10/xml-exc-c14n#'],
+      inclusiveNamespacesPrefixList: ['soap', 'wcf', 'wsa'],
     });
     //
     sig.canonicalizationAlgorithm = 'http://www.w3.org/2001/10/xml-exc-c14n#';
@@ -44,11 +77,9 @@ const firmarSobre = async (
       'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256';
 
     const keyInfoContent = `
-    <wsse:SecurityTokenReference wsu:Id="STR-7263790894BC9CCD41173783960969321">
-    <wsse:Reference URI="#X509-7263790894BC9CCD41173783960969219" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3"/>
-    </wsse:SecurityTokenReference>
-  </ds:KeyInfo>
-`;
+    <wsse:SecurityTokenReference wsu:Id="STR-7263790894BC9CCD41173783960969321" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+      <wsse:Reference URI="#X509-7263790894BC9CCD41173783960969219" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3"/>
+    </wsse:SecurityTokenReference>`;
 
     // Set the getKeyInfoContent method
     sig.getKeyInfoContent = () => keyInfoContent;
@@ -59,7 +90,7 @@ const firmarSobre = async (
     };
 
     sig.computeSignature(sobreAFirmar, {
-      inclusiveNamespacesPrefixList: ['soap', 'wcf'],
+      inclusiveNamespacesPrefixList: ['soap', 'wcf', 'wsa'],
       attrs: { Id: idForSignature },
       prefix: 'ds',
       location: {
@@ -80,7 +111,6 @@ const firmarSobre = async (
   }
 };
 
-
 const enviarSobre = async (action, endPoint, sobreFirmado) => {
   const actionUrl = `http://wcf.dian.colombia/IWcfDianCustomerServices/${action}`;
 
@@ -97,12 +127,18 @@ const enviarSobre = async (action, endPoint, sobreFirmado) => {
       headers: headers,
       body: sobreFirmado,
     });
-
-    if (!response) {
-      throw new Error(`HTTP Error: ${response.status}`);
+    // Detectar errores HTTP (e.g., 500) y capturar el cuerpo (HTML)
+    if (!response.ok) {
+      const errorBody = await response.text();
+      const err = new Error(`HTTP Error ${response.status}`);
+      err.statusCode = response.status;
+      err.body = errorBody;
+      throw err;
     }
 
     const responseXml = await response.text();
+
+    console.log('SOAP Response:', responseXml);
 
     return responseXml; // Retornamos el XML para su posterior procesamiento
   } catch (error) {

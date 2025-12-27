@@ -191,4 +191,4 @@ const recuperaMailDian = (cufeFraFirmada) => {
   imap.connect();
 };
 
-module.exports = recuperaMailDian;
+module.exports = { recuperaMailDian };

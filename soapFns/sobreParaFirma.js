@@ -1,14 +1,21 @@
 const { DateTime } = require('luxon');
 const fs = require('fs');
 
-const sobreParaFirma = (nameFile, action, endPoint, testSetId, ambient) => {
+const sobreParaFirma = (
+  nameFile,
+  action,
+  endPoint,
+  testSetId,
+  ambient,
+  zip64
+) => {
   const creatTime = DateTime.utc().toISO();
 
   const expiresTime = DateTime.utc().plus({ minutes: 1 }).toISO();
 
-  const doc_base64 = fs.readFileSync('./xmlFiles/doc_base64.txt', {
-    encoding: 'utf8',
-  });
+  // const doc_base64 = fs.readFileSync('./xmlFiles/doc_base64.txt', {
+  //   encoding: 'utf8',
+  // });
 
   let sobre = `
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
@@ -20,8 +27,8 @@ const sobreParaFirma = (nameFile, action, endPoint, testSetId, ambient) => {
         <wsu:Created>${creatTime}</wsu:Created>
         <wsu:Expires>${expiresTime}</wsu:Expires>
       </wsu:Timestamp>
-      <wsse:BinarySecurityToken EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3" wsu:Id="X509-7263790894BC9CCD41173783960969219">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</wsse:BinarySecurityToken>
-    </wsse:Security>
+      <wsse:BinarySecurityToken EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3" wsu:Id="X509-7263790894BC9CCD41173783960969219">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</wsse:BinarySecurityToken>
+      </wsse:Security>
     <wsa:Action>http://wcf.dian.colombia/IWcfDianCustomerServices/${action}</wsa:Action>
     <wsa:To wsu:Id="id-7263790894BC9CCD41173783960969322"
       xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">${endPoint}</wsa:To>
@@ -31,14 +38,14 @@ const sobreParaFirma = (nameFile, action, endPoint, testSetId, ambient) => {
       <!--Optional:-->
       <wcf:fileName>${nameFile}</wcf:fileName>
       <!--Optional:-->
-      <wcf:contentFile>${doc_base64}</wcf:contentFile>
+      <wcf:contentFile>${zip64}</wcf:contentFile>
        <!--Optional:-->`;
   if (testSetId.length > 0) {
     sobre += `<wcf:testSetId>${testSetId}</wcf:testSetId>`;
   }
 
   sobre += `
-    </wcf:${action}>
+  </wcf:${action}>
   </soap:Body>
 </soap:Envelope>
 `;

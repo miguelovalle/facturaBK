@@ -1,41 +1,24 @@
+const nodemailer = require('nodemailer');
 
-const sendmail= (email) =>{
- const nodemailer = require('nodemailer');
-const path = require('path');
+async function sendMail(options) {
+  try {
+    const user = process.env.GMAIL_USER || 'edelmira.marinos@gmail.com';
+    const pass = process.env.GMAIL_APP_PASSWORD || '';
 
-async function enviarFactura() {
-    // Configuración de transporte SMTP con Gmail
-    let transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-            user: 'tucorreo@gmail.com',
-            pass: 'TU_CONTRASEÑA_DE_APLICACION'
-        }
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: { user, pass },
     });
 
-    // Configuración del correo
-    let info = await transporter.sendMail({
-        from: '"Marinos Bar Pescadero Restaurante" <tucorreo@gmail.com>', // Remitente
-        to: email, // Destinatario
-        subject: 'Factura electrónica',
-        text: 'Adjunto encontrarás tu factura electrónica.',
-        html: '<p>Adjunto encontrarás tu <b>factura electrónica</b>.</p>',
-        attachments: [
-            {
-                filename: 'factura.xml',
-                path: path.join(__dirname, 'factura.xml'), // Ruta del archivo XML
-                contentType: 'text/xml'
-            },
-            {
-                filename: 'factura.pdf',
-                path: path.join(__dirname, 'factura.pdf'), // Ruta del PDF si tienes uno
-                contentType: 'application/pdf'
-            }
-        ]
-    });
-
+    const info = await transporter.sendMail(options);
     console.log('Correo enviado:', info.messageId);
+    return info;
+  } catch (error) {
+    console.error('Error al enviar correo:', error.message);
+    return null;
+  }
 }
- 
-}
-module.exports = { sendmail };
+
+module.exports = { sendMail };
